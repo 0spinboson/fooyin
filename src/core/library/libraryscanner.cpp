@@ -23,7 +23,9 @@
 #include "libraryscansession.h"
 #include "libraryscanutils.h"
 
+#include <core/engine/audioloader.h>
 #include <core/playlist/playlistloader.h>
+#include <core/playlist/playlistparser.h>
 #include <core/track.h>
 #include <core/trackmetadatastore.h>
 #include <utils/database/dbconnectionhandler.h>
@@ -31,11 +33,72 @@
 #include <utils/timer.h>
 #include <utils/utils.h>
 
+#include <QBuffer>
 #include <QLoggingCategory>
 
 #include <algorithm>
+#include <map>
+#include <ranges>
 
 Q_LOGGING_CATEGORY(LIB_SCANNER, "fy.scanner")
+
+namespace {
+using namespace Qt::StringLiterals;
+
+/*!
+ * Regenerates the tracks of @p parentTrack's embedded cue sheet.
+ *
+ * This mirrors LibraryTrackResolver::readEmbeddedPlaylistTracks(), which isn't reachable here because
+ * LibraryScanner::scanTracks() runs without a scan session.
+ */
+Fooyin::TrackList readEmbeddedCueTracks(const Fooyin::Track& parentTrack, Fooyin::PlaylistLoader* playlistLoader,
+                                        const std::shared_ptr<Fooyin::TrackMetadataStore>& metadataStore,
+                                        Fooyin::AudioLoader* audioLoader)
+{
+    const QStringList cues = parentTrack.extraTag(u"CUESHEET"_s);
+    if(cues.empty()) {
+        return {};
+    }
+
+    auto* parser = playlistLoader->parserForExtension(u"cue"_s);
+    if(!parser) {
+        return {};
+    }
+
+    QByteArray bytes{cues.front().toUtf8()};
+    QBuffer buffer{&bytes};
+    if(!buffer.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        qCInfo(LIB_SCANNER) << "Can't open buffer for reading:" << buffer.errorString();
+        return {};
+    }
+
+    Fooyin::PlaylistParser::ReadPlaylistEntry readEntry;
+    readEntry.readTrack = [&metadataStore, audioLoader](const Fooyin::Track& playlistTrack) {
+        Fooyin::Track readTrack{playlistTrack};
+        readTrack.setMetadataStore(metadataStore);
+        if(!audioLoader->readTrackMetadata(readTrack)) {
+            return playlistTrack;
+        }
+
+        Fooyin::readFileProperties(readTrack);
+        readTrack.generateHash();
+
+        return readTrack;
+    };
+    readEntry.canLoadTrack = [audioLoader](const Fooyin::Track& playlistTrack) {
+        return static_cast<bool>(audioLoader->loadDecoderForTrack(playlistTrack).decoder);
+    };
+
+    Fooyin::TrackList tracks = parser->readPlaylist(&buffer, parentTrack.filepath(), {}, readEntry, false);
+    Fooyin::applyCueTrackTags(parentTrack, tracks);
+    for(auto& cueTrack : tracks) {
+        cueTrack.setMetadataStore(metadataStore);
+        cueTrack.generateHash();
+    }
+
+    return tracks;
+}
+} // namespace
 
 namespace Fooyin {
 ScanProgress LibraryScanner::makeProgress(const int current, const QString& file, const int total,
@@ -215,6 +278,10 @@ void LibraryScanner::scanTracks(const TrackList& tracks, const bool onlyModified
     TrackList tracksToUpdate;
     int processedTracks{0};
 
+    // Tracks generated from an embedded cue sheet have no file of their own, so they're reloaded per parent
+    // file after the main loop. External cue tracks are still skipped; their metadata comes from the .cue.
+    std::map<QString, TrackList> embeddedCueTracks;
+
     for(const Track& track : tracks) {
         if(!shouldContinue()) {
             Q_EMIT progressChanged(
@@ -225,6 +292,9 @@ void LibraryScanner::scanTracks(const TrackList& tracks, const bool onlyModified
         }
 
         if(track.hasCue()) {
+            if(track.hasEmbeddedCue() && track.isInDatabase()) {
+                embeddedCueTracks[track.filepath()].push_back(track);
+            }
             continue;
         }
 
@@ -279,6 +349,73 @@ void LibraryScanner::scanTracks(const TrackList& tracks, const bool onlyModified
         ++processedTracks;
         Q_EMIT progressChanged(makeProgress(processedTracks, track.filepath(), static_cast<int>(tracks.size()),
                                             ScanProgress::Phase::ReadingMetadata, 0));
+    }
+
+    for(const auto& [filepath, existingCueTracks] : embeddedCueTracks) {
+        if(!shouldContinue()) {
+            Q_EMIT progressChanged(
+                makeProgress(processedTracks, {}, processedTracks, ScanProgress::Phase::Finished, 0));
+            setState(Idle);
+            Q_EMIT finished();
+            return;
+        }
+
+        processedTracks += static_cast<int>(existingCueTracks.size());
+        Q_EMIT progressChanged(makeProgress(processedTracks, filepath, static_cast<int>(tracks.size()),
+                                            ScanProgress::Phase::ReadingMetadata, 0));
+
+        if(onlyModified) {
+            const QFileInfo info{filepath};
+            const QDateTime lastModifiedTime{info.lastModified()};
+            const uint64_t lastModified
+                = lastModifiedTime.isValid() ? static_cast<uint64_t>(lastModifiedTime.toMSecsSinceEpoch()) : 0;
+
+            const bool anyModified = std::ranges::any_of(
+                existingCueTracks, [lastModified](const Track& track) { return track.modifiedTime() < lastModified; });
+            if(!anyModified) {
+                continue;
+            }
+        }
+
+        Track parentTrack{filepath, existingCueTracks.front().subsong(), m_metadataStore};
+        if(!m_audioLoader->readTrackMetadata(parentTrack)) {
+            qCDebug(LIB_SCANNER) << "Failed to re-read embedded cue parent:" << filepath;
+            continue;
+        }
+
+        TrackList reloadedTracks
+            = readEmbeddedCueTracks(parentTrack, m_playlistLoader.get(), m_metadataStore, m_audioLoader.get());
+        if(reloadedTracks.empty()) {
+            qCDebug(LIB_SCANNER) << "No cue tracks regenerated for:" << filepath;
+            continue;
+        }
+
+        for(Track& reloadedTrack : reloadedTracks) {
+            // Prefer the physical segment match; fall back to track number in case the cue sheet's
+            // offsets changed since the track was added.
+            auto existing = std::ranges::find_if(existingCueTracks, [&reloadedTrack](const Track& track) {
+                return track.sameIdentityAs(reloadedTrack);
+            });
+            if(existing == existingCueTracks.cend()) {
+                existing = std::ranges::find_if(existingCueTracks, [&reloadedTrack](const Track& track) {
+                    return !track.trackNumber().isEmpty() && track.trackNumber() == reloadedTrack.trackNumber();
+                });
+            }
+            if(existing == existingCueTracks.cend()) {
+                continue;
+            }
+
+            reloadedTrack.setId(existing->id());
+            reloadedTrack.setLibraryId(existing->libraryId());
+            reloadedTrack.setAddedTime(existing->addedTime());
+            reloadedTrack.setIsEnabled(existing->isEnabled());
+            mergeReloadedTrackStats(reloadedTrack, *existing,
+                                    {.overwriteRatingOnReload    = config.overwriteRatingOnReload,
+                                     .overwritePlaycountOnReload = config.overwritePlaycountOnReload});
+            reloadedTrack.generateHash();
+
+            tracksToUpdate.push_back(reloadedTrack);
+        }
     }
 
     if(!tracksToAdd.empty()) {
