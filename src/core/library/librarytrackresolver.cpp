@@ -450,6 +450,7 @@ TrackList LibraryTrackResolver::readEmbeddedPlaylistTracks(const Track& track)
 
     if(auto* parser = m_playlistLoader->parserForExtension(u"cue"_s)) {
         TrackList tracks = parser->readPlaylist(&buffer, track.filepath(), {}, readEntry, false);
+        applyCueTrackTags(track, tracks);
         for(auto& playlistTrack : tracks) {
             playlistTrack.setMetadataStore(m_metadataStore);
             playlistTrack.generateHash();

@@ -44,4 +44,12 @@ FYCORE_EXPORT std::optional<QFileInfo> findMatchingCue(const QFileInfo& file, co
 FYCORE_EXPORT std::optional<QFileInfo> findMatchingCue(const QFileInfo& file);
 FYCORE_EXPORT void readFileProperties(Track& track);
 FYCORE_EXPORT void mergeReloadedTrackStats(Track& track, const Track& existingTrack, const TrackReloadOptions& options);
+/*!
+ * Applies per-track Cue_trackNN_* tags from @p parentTrack to the tracks generated from its embedded cue sheet.
+ *
+ * APEv2 files with an embedded CUESHEET can store per-track metadata as separate Cue_track01_composer,
+ * Cue_track02_performer, etc. tags. These are matched to @p cueTracks by track number and applied to the
+ * corresponding field, then stripped from every generated track so they don't appear as inherited clutter.
+ */
+FYCORE_EXPORT void applyCueTrackTags(const Track& parentTrack, TrackList& cueTracks);
 } // namespace Fooyin

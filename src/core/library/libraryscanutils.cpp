@@ -20,8 +20,12 @@
 #include "libraryscanutils.h"
 
 #include <QDir>
+#include <QRegularExpression>
 
 #include <ranges>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 using namespace Qt::StringLiterals;
 
@@ -237,5 +241,79 @@ void mergeReloadedTrackStats(Track& track, const Track& existingTrack, const Tra
     track.setPlayCount(std::max(existingTrack.playCount(), track.playCount()));
     track.setFirstPlayed(minNonZero(existingTrack.firstPlayed(), track.firstPlayed()));
     track.setLastPlayed(std::max(existingTrack.lastPlayed(), track.lastPlayed()));
+}
+
+void applyCueTrackTags(const Track& parentTrack, TrackList& cueTracks)
+{
+    if(cueTracks.empty()) {
+        return;
+    }
+
+    static const QRegularExpression cueTagRegex{u"^CUE_TRACK(\\d+)_(.+)$"_s, QRegularExpression::CaseInsensitiveOption};
+
+    std::unordered_map<int, std::vector<std::pair<QString, QStringList>>> tagsByTrackNum;
+    bool foundCueTags{false};
+
+    const Track::ExtraTags parentTags = parentTrack.extraTags();
+    for(const auto& [key, values] : parentTags.entries()) {
+        const QRegularExpressionMatch match = cueTagRegex.match(key);
+        if(!match.hasMatch()) {
+            continue;
+        }
+
+        foundCueTags = true;
+
+        bool numberOk{false};
+        const int trackNum = match.captured(1).toInt(&numberOk);
+        if(numberOk && !values.empty()) {
+            tagsByTrackNum[trackNum].emplace_back(match.captured(2).toUpper(), values);
+        }
+    }
+
+    if(!foundCueTags) {
+        return;
+    }
+
+    for(Track& cueTrack : cueTracks) {
+        // Every generated track inherits the parent file's tags, so each one carries the Cue_track* tags for
+        // all other tracks. Rebuild the extra tags without them rather than using removeExtraTag(), which
+        // would record them in removedTags() and cause a later tag write to delete them from the file.
+        const Track::ExtraTags inheritedTags = cueTrack.extraTags();
+        cueTrack.clearExtraTags();
+        for(const auto& [key, values] : inheritedTags.entries()) {
+            if(!cueTagRegex.match(key).hasMatch()) {
+                cueTrack.addExtraTag(key, values);
+            }
+        }
+
+        bool numberOk{false};
+        const int trackNum = cueTrack.trackNumber().toInt(&numberOk);
+        if(!numberOk) {
+            continue;
+        }
+
+        const auto trackTags = tagsByTrackNum.find(trackNum);
+        if(trackTags == tagsByTrackNum.cend()) {
+            continue;
+        }
+
+        for(const auto& [field, values] : trackTags->second) {
+            if(field == "ARTIST"_L1) {
+                cueTrack.setArtists(values);
+            }
+            else if(field == "COMPOSER"_L1) {
+                cueTrack.setComposers(values);
+            }
+            else if(field == "PERFORMER"_L1) {
+                cueTrack.setPerformers(values);
+            }
+            else if(field == "GENRE"_L1) {
+                cueTrack.setGenres(values);
+            }
+            else {
+                cueTrack.replaceExtraTag(field, values);
+            }
+        }
+    }
 }
 } // namespace Fooyin
