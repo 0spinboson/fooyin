@@ -21,11 +21,13 @@
 
 #include "fycore_export.h"
 
+#include <core/playlist/playlistparser.h>
 #include <core/track.h>
 
 #include <QFileInfo>
 
 #include <optional>
+#include <vector>
 
 namespace Fooyin {
 struct FYCORE_EXPORT TrackReloadOptions
@@ -52,4 +54,22 @@ FYCORE_EXPORT void mergeReloadedTrackStats(Track& track, const Track& existingTr
  * corresponding field, then stripped from every generated track so they don't appear as inherited clutter.
  */
 FYCORE_EXPORT void applyCueTrackTags(const Track& parentTrack, TrackList& cueTracks);
+/*!
+ * Maps each reloaded cue track to the index of the existing track it should update.
+ *
+ * Identity matches (physical segment) are resolved across all tracks first; a track-number
+ * fallback then runs over the tracks left unclaimed, covering cue sheets whose offsets changed.
+ * Each existing track is claimed at most once, so two reloaded tracks can never target the same
+ * database row. Returns std::nullopt for a reloaded track with no match.
+ */
+FYCORE_EXPORT std::vector<std::optional<qsizetype>> matchReloadedCueTracks(const TrackList& reloadedTracks,
+                                                                           const TrackList& existingTracks);
+/*!
+ * Parses @p parentTrack's embedded CUESHEET tag into its constituent tracks.
+ *
+ * Applies applyCueTrackTags() to the result, so every caller that expands an embedded cue sheet
+ * gets the same per-track metadata. Returns an empty list when there is no cue sheet to parse.
+ */
+FYCORE_EXPORT TrackList parseEmbeddedCueSheet(const Track& parentTrack,
+                                              const PlaylistParser::ReadPlaylistEntry& readEntry);
 } // namespace Fooyin

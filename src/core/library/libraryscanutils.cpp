@@ -19,13 +19,19 @@
 
 #include "libraryscanutils.h"
 
+#include "playlist/parsers/cueparser.h"
+
+#include <QBuffer>
 #include <QDir>
+#include <QLoggingCategory>
 #include <QRegularExpression>
 
 #include <ranges>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+Q_DECLARE_LOGGING_CATEGORY(LIB_SCANNER)
 
 using namespace Qt::StringLiterals;
 
@@ -243,6 +249,69 @@ void mergeReloadedTrackStats(Track& track, const Track& existingTrack, const Tra
     track.setLastPlayed(std::max(existingTrack.lastPlayed(), track.lastPlayed()));
 }
 
+TrackList parseEmbeddedCueSheet(const Track& parentTrack, const PlaylistParser::ReadPlaylistEntry& readEntry)
+{
+    const QStringList cues = parentTrack.extraTag(u"CUESHEET"_s);
+    if(cues.empty()) {
+        return {};
+    }
+
+    QByteArray bytes{cues.front().toUtf8()};
+    QBuffer buffer{&bytes};
+    if(!buffer.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        qCInfo(LIB_SCANNER) << "Can't open cue sheet buffer for reading:" << buffer.errorString();
+        return {};
+    }
+
+    // A default-constructed QDir routes readPlaylist() to CueParser's embedded-cue path.
+    CueParser parser;
+    TrackList tracks = parser.readPlaylist(&buffer, parentTrack.filepath(), {}, readEntry, false);
+    applyCueTrackTags(parentTrack, tracks);
+
+    return tracks;
+}
+
+std::vector<std::optional<qsizetype>> matchReloadedCueTracks(const TrackList& reloadedTracks,
+                                                             const TrackList& existingTracks)
+{
+    std::vector<std::optional<qsizetype>> matches(reloadedTracks.size());
+    std::vector<bool> claimed(existingTracks.size(), false);
+
+    // Physical identity is the stronger signal, so resolve it across every track before falling
+    // back. Claiming as we go keeps two reloaded tracks from targeting the same database row.
+    for(qsizetype i{0}; i < std::ssize(reloadedTracks); ++i) {
+        for(qsizetype j{0}; j < std::ssize(existingTracks); ++j) {
+            if(!claimed[j] && existingTracks[j].sameIdentityAs(reloadedTracks[i])) {
+                matches[i] = j;
+                claimed[j] = true;
+                break;
+            }
+        }
+    }
+
+    // Track number covers cue sheets whose offsets moved, over the unclaimed remainder only.
+    for(qsizetype i{0}; i < std::ssize(reloadedTracks); ++i) {
+        if(matches[i].has_value()) {
+            continue;
+        }
+
+        const QString trackNumber = reloadedTracks[i].trackNumber();
+        if(trackNumber.isEmpty()) {
+            continue;
+        }
+
+        for(qsizetype j{0}; j < std::ssize(existingTracks); ++j) {
+            if(!claimed[j] && existingTracks[j].trackNumber() == trackNumber) {
+                matches[i] = j;
+                claimed[j] = true;
+                break;
+            }
+        }
+    }
+
+    return matches;
+}
+
 void applyCueTrackTags(const Track& parentTrack, TrackList& cueTracks)
 {
     if(cueTracks.empty()) {
@@ -301,6 +370,9 @@ void applyCueTrackTags(const Track& parentTrack, TrackList& cueTracks)
             if(field == "ARTIST"_L1) {
                 cueTrack.setArtists(values);
             }
+            else if(field == "ALBUMARTIST"_L1) {
+                cueTrack.setAlbumArtists(values);
+            }
             else if(field == "COMPOSER"_L1) {
                 cueTrack.setComposers(values);
             }
@@ -310,8 +382,23 @@ void applyCueTrackTags(const Track& parentTrack, TrackList& cueTracks)
             else if(field == "GENRE"_L1) {
                 cueTrack.setGenres(values);
             }
-            else {
+            else if(field == "TITLE"_L1) {
+                cueTrack.setTitle(values.front());
+            }
+            else if(field == "DATE"_L1) {
+                cueTrack.setDate(values.front());
+            }
+            else if(field == "COMMENT"_L1) {
+                cueTrack.setComment(values.front());
+            }
+            else if(Track::isExtraTag(field)) {
                 cueTrack.replaceExtraTag(field, values);
+            }
+            else {
+                // Never let a reserved name into extraTags: the tag writer replays extra tags over
+                // the canonical fields it just wrote, so an extra tag named TITLE or RATING would
+                // overwrite the real value in the user's file.
+                qCDebug(LIB_SCANNER) << "Ignoring reserved field in Cue_track tag:" << field;
             }
         }
     }

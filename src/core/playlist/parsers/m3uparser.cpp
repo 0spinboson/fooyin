@@ -20,6 +20,7 @@
 #include "m3uparser.h"
 
 #include "cueparser.h"
+#include "library/libraryscanutils.h"
 
 #include <core/track.h>
 
@@ -137,23 +138,6 @@ TrackList readCuePlaylist(const QString& path, const PlaylistParser::ReadPlaylis
 
     CueParser parser;
     return parser.readPlaylist(&cueFile, path, cueDir, readEntry, skipNotFound);
-}
-
-TrackList readEmbeddedCueTracks(const Track& track, const PlaylistParser::ReadPlaylistEntry& readEntry)
-{
-    const auto cueSheet = track.extraTag(u"CUESHEET"_s);
-    if(cueSheet.empty()) {
-        return {};
-    }
-
-    QByteArray bytes{cueSheet.front().toUtf8()};
-    QBuffer buffer{&bytes};
-    if(!buffer.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        return {};
-    }
-
-    CueParser parser;
-    return parser.readPlaylist(&buffer, track.filepath(), {}, readEntry, false);
 }
 
 QString cueExportPath(const Track& track)
@@ -279,7 +263,7 @@ TrackList M3uParser::readPlaylist(QIODevice* device, const QString& filepath, co
 
             track = readEntry.readTrack(track);
             if(track.hasExtraTag(u"CUESHEET"_s)) {
-                if(const auto cueTracks = readEmbeddedCueTracks(track, readEntry); !cueTracks.empty()) {
+                if(const auto cueTracks = parseEmbeddedCueSheet(track, readEntry); !cueTracks.empty()) {
                     tracks.insert(tracks.end(), cueTracks.cbegin(), cueTracks.cend());
                     metadata = {};
                     continue;
